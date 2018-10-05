@@ -21,7 +21,6 @@ import (
 	ethTypes "github.com/livepeer/go-livepeer/eth/types"
 	ffmpeg "github.com/livepeer/lpms/ffmpeg"
 	"github.com/livepeer/lpms/stream"
-	"github.com/livepeer/lpms/transcoder"
 )
 
 const TranscodeLoopTimeout = 10 * time.Minute
@@ -143,7 +142,6 @@ type transcodeConfig struct {
 	ResultStrmIDs []StreamID
 	ClaimManager  eth.ClaimManager
 	JobID         *big.Int
-	Transcoder    transcoder.Transcoder
 }
 
 func (n *LivepeerNode) getSegmentChan(job *ethTypes.Job) (SegmentChan, error) {
@@ -243,9 +241,24 @@ func (n *LivepeerNode) transcodeAndCacheSeg(config transcodeConfig, ss *SignedSe
 		glog.Errorf("Media length check failed: %v", err)
 		return terr(err)
 	}
+	seg.Name = fmt.Sprintf("%s_%d.ts", config.StrmID, seg.SeqNo)
+	url := fmt.Sprintf("%v/stream/%s", n.ServiceURI, seg.Name)
+
+	// Check if there's a transcoder available
+	var transcoder Transcoder
+	if n.Transcoder == nil {
+		return terr(fmt.Errorf("No transcoders available on orchestrator"))
+	}
+	transcoder = n.Transcoder
+
+	// Small optimization so we aren't using http for local transcoding
+	if _, ok := transcoder.(*LocalTranscoder); ok {
+		url = fname
+	}
+
 	//Do the transcoding
 	start := time.Now()
-	tData, err := config.Transcoder.Transcode(fname)
+	tData, err := transcoder.Transcode(url, config.Profiles)
 	if err != nil {
 		glog.Errorf("Error transcoding seg: %v - %v", seg.Name, err)
 		return terr(err)
@@ -301,14 +314,12 @@ func (n *LivepeerNode) transcodeSegmentLoop(job *ethTypes.Job, segChan SegmentCh
 		}
 		resultStrmIDs[i] = strmID
 	}
-	tr := transcoder.NewFFMpegSegmentTranscoder(job.Profiles, n.WorkDir)
 	config := transcodeConfig{
 		StrmID:        job.StreamId,
 		Profiles:      job.Profiles,
 		ResultStrmIDs: resultStrmIDs,
 		JobID:         job.JobId,
 		ClaimManager:  cm,
-		Transcoder:    tr,
 	}
 	go func() {
 		for {
