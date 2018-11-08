@@ -67,6 +67,58 @@ func genTranscoderReq(b Broadcaster, jid int64) (*net.TranscoderRequest, error) 
 	return &net.TranscoderRequest{JobId: jid, Sig: sig}, nil
 }
 
+func CheckTranscoderAvailability(orch Orchestrator) bool {
+	time.Sleep(1)
+	ts := time.Now()
+	ts_signature, err := orch.Sign([]byte(fmt.Sprintf("%v", ts)))
+	if err != nil {
+		return false
+	}
+
+	ping := crypto.Keccak256(ts_signature)
+
+	orch_client, err := startOrchestratorClient(orch.ServiceURI().String())
+	if err != nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
+	defer cancel()
+
+	pong, err := orch_client.Ping(ctx, &net.PingPong{Value: ping})
+	if err != nil {
+		return false
+	}
+
+	// is a signature the same as an address? is this the verify function we need here?
+	return verifyMsgSig(orch.Address(), string(pong.Value), ping)
+}
+
+func startOrchestratorClient(url_string string) (net.OrchestratorClient, error) {
+	uri, err := url.Parse(url_string)
+
+	if err != nil {
+		glog.Error("Could not parse orchestrator URI: ", err)
+		return nil, err
+	}
+
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+
+	glog.Infof("Connecting RPC to %v", uri)
+	conn, err := grpc.Dial(uri.Host,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithBlock(),
+		grpc.WithTimeout(GRPCConnectTimeout))
+	if err != nil {
+		glog.Error("Did not connect: ", err)
+		return nil, errors.New("Did not connect: " + err.Error())
+	}
+	defer conn.Close()
+	c := net.NewOrchestratorClient(conn)
+
+	return c, nil
+}
+
 func jobClaimable(orch Orchestrator, job *lpTypes.Job) bool {
 	if len(job.Profiles) <= 0 {
 		// This is just to be extra cautious:
@@ -188,6 +240,14 @@ func verifySegCreds(job *lpTypes.Job, segCreds string) (*net.SegData, error) {
 		return nil, fmt.Errorf("Segment sig check failed")
 	}
 	return &segData, nil
+}
+
+func ping(context context.Context, req *net.PingPong, orch Orchestrator) (*net.PingPong, error) {
+	value, err := orch.Sign(req.Value)
+	if err != nil {
+		return nil, nil
+	}
+	return &net.PingPong{Value: value}, nil
 }
 
 func getTranscoder(context context.Context, orch Orchestrator, req *net.TranscoderRequest) (*net.TranscoderInfo, error) {
@@ -325,6 +385,10 @@ func (h *lphttp) GetTranscoder(context context.Context, req *net.TranscoderReque
 	return getTranscoder(context, h.orchestrator, req)
 }
 
+func (h *lphttp) Ping(context context.Context, req *net.PingPong) (*net.PingPong, error) {
+	return ping(context, req, h.orchestrator)
+}
+
 func (h *lphttp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ct := r.Header.Get("Content-Type")
 	if r.ProtoMajor == 2 && strings.HasPrefix(ct, "application/grpc") {
@@ -361,27 +425,17 @@ func StartTranscodeServer(orch Orchestrator, bind string, mux *http.ServeMux, wo
 }
 
 func StartBroadcastClient(bcast Broadcaster, orchestratorServer string) error {
+	c, err := startOrchestratorClient(orchestratorServer)
+	if err != nil {
+		return err
+	}
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+
 	httpc := &http.Client{
 		Transport: &http2.Transport{TLSClientConfig: tlsConfig},
 		Timeout:   HTTPTimeout,
 	}
-	uri, err := url.Parse(orchestratorServer)
-	if err != nil {
-		glog.Error("Could not parse orchestrator URI: ", err)
-		return err
-	}
-	glog.Infof("Connecting RPC to %v", orchestratorServer)
-	conn, err := grpc.Dial(uri.Host,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-		grpc.WithBlock(),
-		grpc.WithTimeout(GRPCConnectTimeout))
-	if err != nil {
-		glog.Error("Did not connect: ", err)
-		return errors.New("Did not connect: " + err.Error())
-	}
-	defer conn.Close()
-	c := net.NewOrchestratorClient(conn)
+
 	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
 	defer cancel()
 
